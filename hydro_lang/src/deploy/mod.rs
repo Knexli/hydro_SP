@@ -46,3 +46,11 @@ pub mod deploy_graph_containerized_ecs;
 #[cfg(feature = "ecs_deploy")]
 #[cfg_attr(docsrs, doc(cfg(feature = "ecs_deploy")))]
 pub use deploy_graph_containerized_ecs::*;
+
+#[cfg(stageleft_runtime)]
+#[cfg(feature = "knative_deploy")]
+pub mod deploy_graph_containerized_knative;
+
+#[cfg(stageleft_runtime)]
+#[cfg(feature = "knative_deploy")]
+pub use deploy_graph_containerized_knative::*;

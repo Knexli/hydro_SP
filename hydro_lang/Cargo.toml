@@ -82,6 +82,8 @@ ecs_deploy = [
     "dep:anyhow",
 ]
 
+knative_deploy = ["deploy", "ecs_runtime"]
+
 maelstrom = [
     "trybuild",
     "maelstrom_runtime",

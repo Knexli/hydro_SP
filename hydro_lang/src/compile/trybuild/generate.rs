@@ -51,8 +51,8 @@ pub enum DeployMode {
     #[cfg(feature = "deploy")]
     /// Standard `HydroDeploy`
     HydroDeploy,
-    #[cfg(any(feature = "docker_deploy", feature = "ecs_deploy"))]
-    /// Containerized deployment (Docker/ECS)
+    #[cfg(any(feature = "docker_deploy", feature = "ecs_deploy", feature = "knative_deploy"))]
+    /// Containerized deployment (Docker/ECS/Knative)
     Containerized,
     #[cfg(feature = "maelstrom")]
     /// Maelstrom deployment with stdin/stdout JSON protocol
@@ -234,7 +234,7 @@ pub fn compile_graph_trybuild(
     let dfir_ident = quote::format_ident!("{}", crate::compile::DFIR_IDENT);
 
     let source_ast: syn::File = match deploy_mode {
-        #[cfg(any(feature = "docker_deploy", feature = "ecs_deploy"))]
+        #[cfg(any(feature = "docker_deploy", feature = "ecs_deploy", feature = "knative_deploy"))]
         DeployMode::Containerized => {
             syn::parse_quote! {
                 #![allow(unused_imports, unused_crate_dependencies, missing_docs, non_snake_case, unexpected_cfgs, unfulfilled_lint_expectations)]
