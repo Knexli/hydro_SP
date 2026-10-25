@@ -632,7 +632,7 @@ async fn create_and_start_container(
 }
 
 #[instrument(level = "trace", skip_all, fields(%image_name))]
-async fn build_and_create_image(
+pub(crate) async fn build_and_create_image(
     rust_crate: &Rc<RefCell<Option<RustCrate>>>,
     rustflags: Option<&str>,
     config: &[String],

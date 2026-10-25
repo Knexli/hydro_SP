@@ -28,12 +28,12 @@ pub mod deploy_graph;
 pub use deploy_graph::*;
 
 #[cfg(stageleft_runtime)]
-#[cfg(feature = "docker_deploy")]
+#[cfg(any(feature = "docker_deploy", feature = "knative_deploy"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "docker_deploy")))]
 pub mod deploy_graph_containerized;
 
 #[cfg(stageleft_runtime)]
-#[cfg(feature = "docker_deploy")]
+#[cfg(any(feature = "docker_deploy", feature = "knative_deploy"))]
 #[cfg_attr(docsrs, doc(cfg(feature = "docker_deploy")))]
 pub use deploy_graph_containerized::*;
 

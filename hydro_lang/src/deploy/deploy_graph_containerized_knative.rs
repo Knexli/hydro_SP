@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::error::Error;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -14,6 +15,12 @@ use serde::{Deserialize, Serialize};
 use stageleft::QuotedWithContext;
 use syn::parse_quote;
 use tracing::{instrument, trace};
+
+use crate::deploy::deploy_graph_containerized::build_and_create_image;
+use dfir_rs::dfir_pipes::pull::Pull;
+use hydro_deploy::{LinuxCompileType, RustCrate};
+use std::fs;
+use std::path::PathBuf;
 
 /// Manifest for exporting - describes all processes, clusters, and their configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +344,16 @@ impl Default for KnativeDeploy {
     }
 }
 
+fn rust_create_from_build(build: &BuildConfig) -> RustCrate {
+    RustCrate::new(&build.project_dir, &build.project_dir)
+        .target_dir(&build.target_dir)
+        .example(build.bin_name.clone())
+        .no_default_features()
+        .features(build.features.clone())
+        .build_env("STAGELEFT_TRYBUILD_BUILD_STAGED", "1")
+        .config("build.incremental = false")
+}
+
 impl KnativeDeploy {
     /// Creates a new ecs deployment.
     pub fn new() -> Self {
@@ -356,6 +373,90 @@ impl KnativeDeploy {
     /// Add an external process to the deployment.
     pub fn add_external(&self, name: String) -> KnativeDeployExternalSpec {
         KnativeDeployExternalSpec { name }
+    }
+
+    pub async fn generate_deploy_files(
+        &self,
+        nodes: &DeployResult<'_, Self>,
+    ) -> Result<(), Box<dyn Error>> {
+        let manifest: HydroManifest = self.export(nodes);
+
+        let first_process = manifest
+            .processes
+            .values()
+            .next()
+            .ok_or("no processes to deploy")?;
+
+        let mut deployment_dir = PathBuf::from(&first_process.build.project_dir).join("deploy");
+
+        if (deployment_dir.exists()) {
+            fs::remove_dir_all(&deployment_dir)?;
+        }
+        fs::create_dir_all(&deployment_dir)?;
+
+        for (process) in manifest.processes.values() {
+            let process_dir = deployment_dir.join(&process.task_family);
+
+            fs::create_dir_all(&process_dir)?;
+
+            let rust_crate = Rc::new(RefCell::new(Some(rust_create_from_build(&process.build))));
+
+            let ports: Vec<u16> = process
+                .ports
+                .values()
+                .map(|port_info| match port_info {
+                    PortInfo::Tcp { port } => *port,
+                })
+                .collect();
+
+            let image_name = format!("dev.local/{}:v1", process.task_family);
+
+            build_and_create_image(
+                &rust_crate,
+                None,
+                &[],
+                &ports,
+                &image_name,
+                None,
+                LinuxCompileType::Musl,
+            )
+            .await?;
+
+            let yaml_text = format!(
+                r"
+
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: {}
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+        - image: dev.local/{}:v1
+          imagePullPolicy: Never{}
+
+",
+                process.task_family,
+                process.task_family,
+                if ports.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        r"
+          ports:
+            - containerPort: {}",
+                        ports[0]
+                    )
+                }
+            );
+
+            let yaml_path = process_dir.join(format!("{}.yaml", process.task_family));
+            fs::write(yaml_path, yaml_text)?;
+        }
+
+        Ok(())
     }
 
     /// Export a deployment manifest describing each process and cluster: its
