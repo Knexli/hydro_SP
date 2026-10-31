@@ -81,7 +81,7 @@ pub struct ClusterManifest {
     pub task_family_prefix: String,
 }
 
-use super::deploy_runtime_containerized_ecs::*;
+use super::deploy_runtime_containerized_knative::*;
 use crate::compile::builder::ExternalPortId;
 use crate::compile::deploy::DeployResult;
 use crate::compile::deploy_provider::{
@@ -548,6 +548,11 @@ fn build_info_from_config(
     }
 }
 
+fn resolve_knative_url(service_name: &str) -> String {
+    // format!("http://{service_name}.default.svc.cluster.local")
+    format!("http://{service_name}.default.svc.cluster.local/_hydro/receive")
+}
+
 impl<'a> Deploy<'a> for KnativeDeploy {
     type InstantiateEnv = Self;
     type Process = KnativeDeployProcess;
@@ -566,16 +571,22 @@ impl<'a> Deploy<'a> for KnativeDeploy {
         networking_info: &crate::networking::NetworkingInfo,
         _external_types: Option<(&syn::Type, &syn::Type)>,
     ) -> (syn::Expr, syn::Expr) {
-        match networking_info {
-            crate::networking::NetworkingInfo::Tcp {
-                fault: crate::networking::TcpFault::FailStop,
-            } => {}
-            _ => panic!("Unsupported networking info: {:?}", networking_info),
-        }
-
+        // match networking_info {
+        //     crate::networking::NetworkingInfo::Tcp {
+        //         fault: crate::networking::TcpFault::FailStop,
+        //     } => {}
+        //     _ => panic!("Unsupported networking info: {:?}", networking_info),
+        // }
+        let target_url = resolve_knative_url(&p2.name);
+        let channel_name = if name.is_some() {
+            name.unwrap()
+        } else {
+            // String::from("placeholder_name")
+            "placeholder_name"
+        };
         deploy_containerized_o2o(
-            &p2.name,
-            name.expect("channel name is required for containerized deployment"),
+            &target_url,
+            &channel_name, // todo channel names later
         )
     }
 

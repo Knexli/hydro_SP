@@ -20,6 +20,7 @@ pub const HYDRO_RUNTIME_FEATURES: &[&str] = &[
     "runtime_measure",
     "docker_runtime",
     "ecs_runtime",
+    "knative_runtime",
     "maelstrom_runtime",
     "sim_runtime",
 ];

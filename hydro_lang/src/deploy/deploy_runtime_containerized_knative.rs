@@ -1,0 +1,703 @@
+#![allow(
+    unused,
+    reason = "unused in trybuild but the __staged version is needed"
+)]
+#![allow(missing_docs, reason = "used internally")]
+
+use std::time::Duration;
+use std::io;
+use std::sync::{Mutex, OnceLock};
+
+use bytes::{Bytes, BytesMut};
+use tokio::sync::mpsc;
+
+use futures::{Sink, SinkExt, Stream, StreamExt};
+use sinktools::lazy::{LazySink, LazySource};
+use sinktools::lazy_sink_source::LazySinkSource;
+use stageleft::{QuotedWithContext, q};
+use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tracing::{Instrument, debug, instrument, span, trace, trace_span};
+
+pub use super::deploy_runtime_containerized::{
+    CHANNEL_MAGIC, CHANNEL_MUX_PORT, CHANNEL_PROTOCOL_VERSION, ChannelHandshake, ChannelMagic,
+    ChannelMux, ChannelProtocolVersion, SocketIdent, cluster_ids, connect_channel,
+    get_or_init_channel_mux, send_handshake,
+};
+
+use crate::location::dynamic::LocationId;
+use crate::location::member_id::TaglessMemberId;
+use crate::location::{LocationKey, MembershipEvent};
+
+
+type Mailbox = (
+    mpsc::Sender<BytesMut>,
+    Mutex<Option<mpsc::Receiver<BytesMut>>>,
+);
+
+static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
+
+fn mailbox() -> &'static Mailbox {
+    MAILBOX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel(64);
+        (tx, Mutex::new(Some(rx)))
+    })
+}
+
+// Called by the application's Axum HTTP handler.
+pub async fn receive_http(body: Bytes) -> Result<(), ()> {
+    mailbox()
+        .0
+        .send(BytesMut::from(body.as_ref()))
+        .await
+        .map_err(|_| ())
+}
+
+// Called by the generated Hydro receiving source.
+pub fn take_http_receiver() -> io::Result<mpsc::Receiver<BytesMut>> {
+    mailbox()
+        .1
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or_else(|| io::Error::other("HTTP receiver already taken"))
+}
+
+pub fn http_sink(
+    url: String,
+) -> impl Sink<Bytes, Error = io::Error> + Unpin {
+    let client = reqwest::Client::new();
+
+    Box::pin(futures::sink::unfold(
+        (client, url),
+        |(client, url), payload: Bytes| async move {
+            eprintln!(
+                "[Hydro sender] POST {} ({} bytes)",
+                url,
+                payload.len()
+            );
+
+            let response = client
+                .post(&url)
+                .body(payload)
+                .send()
+                .await
+                .map_err(|error| {
+                    eprintln!("[Hydro sender] HTTP error: {error}");
+                    std::io::Error::other(error)
+                })?;
+
+            eprintln!(
+                "[Hydro sender] HTTP status: {}",
+                response.status()
+            );
+
+            response
+                .error_for_status()
+                .map_err(std::io::Error::other)?;
+
+            Ok::<_, io::Error>((client, url))
+        },
+    ))
+}
+
+pub async fn handle_hydro_receive(
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    eprintln!(
+        "Archive HTTP receiver got {} bytes", body.len()
+    );
+
+    match receive_http(body).await {
+        Ok(()) => axum::http::StatusCode::ACCEPTED,
+        Err(()) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
+pub fn knative_router<S>() -> axum::Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    axum::Router::new().route(
+        "/_hydro/receive",
+        axum::routing::post(handle_hydro_receive),
+    )
+}
+
+pub fn deploy_containerized_o2o(
+    target_url: &str,
+    channel_name: &str,
+) -> (syn::Expr, syn::Expr) {
+    // channel_name ignored for now (this means that the target will not be able to distinguish where the message is coming form)
+    (
+        // Sender: serialized Hydro bytes -> HTTP POST.
+        q!(LazySink::<_, _, _, bytes::Bytes>::new(
+            move || Box::pin(async move {
+                let target_url = target_url;
+                Result::<_, std::io::Error>::Ok(
+                    self::http_sink(target_url.to_owned())
+                )
+            })
+        ))
+            .splice_untyped_ctx(&()),
+
+        // Receiver: queue -> Hydro stream.
+        q!(LazySource::new(
+            move || Box::pin(async move {
+                let rx = self::take_http_receiver()?;
+
+                let source =
+                    tokio_stream::wrappers::ReceiverStream::new(rx)
+                        .map(|bytes| {
+                            Ok::<_, std::io::Error>(bytes)
+                        });
+
+                Result::<_, std::io::Error>::Ok(source)
+            })
+        ))
+            .splice_untyped_ctx(&()),
+    )
+}
+//
+// pub fn deploy_containerized_o2o(
+//     target_task_family: &str,
+//     channel_name: &str,
+// ) -> (syn::Expr, syn::Expr) {
+//     (
+//         q!(LazySink::<_, _, _, bytes::Bytes>::new(move || Box::pin(
+//             async move {
+//                 let channel_name = channel_name;
+//                 let target_task_family = target_task_family;
+//                 let task_id = self::resolve_task_family_to_task_id(target_task_family).await;
+//                 let ip = self::resolve_task_ip(&task_id).await;
+//                 let target = format!("{}:{}", ip, self::CHANNEL_MUX_PORT);
+//                 debug!(name: "connecting", %target, %target_task_family, %task_id, %channel_name);
+//
+//                 let stream = self::connect_channel(&target).await?;
+//                 let mut sink = FramedWrite::new(stream, LengthDelimitedCodec::new());
+//
+//                 self::send_handshake(&mut sink, channel_name, None).await?;
+//
+//                 Result::<_, std::io::Error>::Ok(sink)
+//             }
+//         )))
+//             .splice_untyped_ctx(&()),
+//         q!(LazySource::new(move || Box::pin(async move {
+//             let channel_name = channel_name;
+//             let mux = self::get_or_init_channel_mux();
+//             let mut rx = mux.register(channel_name.to_owned());
+//
+//             let (_sender_id, source) = rx.recv().await.ok_or_else(|| {
+//                 std::io::Error::new(std::io::ErrorKind::ConnectionReset, "channel mux closed")
+//             })?;
+//
+//             debug!(name: "o2o_channel_connected", %channel_name);
+//
+//             Result::<_, std::io::Error>::Ok(source)
+//         })))
+//             .splice_untyped_ctx(&()),
+//     )
+// }
+
+pub fn deploy_containerized_o2m(channel_name: &str) -> (syn::Expr, syn::Expr) {
+    (
+        q!(sinktools::demux_map_lazy::<_, _, _, _>(
+            move |key: &TaglessMemberId| {
+                let key = key.clone();
+                let channel_name = channel_name.to_owned();
+
+                LazySink::<_, _, _, bytes::Bytes>::new(move || {
+                    Box::pin(async move {
+                        let task_id = key.get_container_name();
+                        let ip = self::resolve_task_ip(task_id).await;
+                        let target = format!("{}:{}", ip, self::CHANNEL_MUX_PORT);
+                        debug!(name: "connecting", %target, %task_id, channel_name = %channel_name);
+
+                        let stream = self::connect_channel(&target).await?;
+                        let mut sink = FramedWrite::new(stream, LengthDelimitedCodec::new());
+
+                        self::send_handshake(&mut sink, &channel_name, None).await?;
+
+                        Result::<_, std::io::Error>::Ok(sink)
+                    })
+                })
+            }
+        ))
+            .splice_untyped_ctx(&()),
+        q!(LazySource::new(move || Box::pin(async move {
+            let channel_name = channel_name;
+            let mux = self::get_or_init_channel_mux();
+            let mut rx = mux.register(channel_name.to_owned());
+
+            let (_sender_id, source) = rx.recv().await.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "channel mux closed")
+            })?;
+
+            debug!(name: "o2m_channel_connected", %channel_name);
+
+            Result::<_, std::io::Error>::Ok(source)
+        })))
+            .splice_untyped_ctx(&()),
+    )
+}
+
+pub fn deploy_containerized_m2o(
+    target_task_family: &str,
+    channel_name: &str,
+) -> (syn::Expr, syn::Expr) {
+    (
+        q!(LazySink::<_, _, _, bytes::Bytes>::new(move || {
+            Box::pin(async move {
+                let channel_name = channel_name;
+                let target_task_family = target_task_family;
+                let target_task_id = self::resolve_task_family_to_task_id(target_task_family).await;
+                let ip = self::resolve_task_ip(&target_task_id).await;
+                let target = format!("{}:{}", ip, self::CHANNEL_MUX_PORT);
+                debug!(name: "connecting", %target, %target_task_family, %target_task_id, %channel_name);
+
+                let stream = self::connect_channel(&target).await?;
+                let mut sink = FramedWrite::new(stream, LengthDelimitedCodec::new());
+
+                let self_task_id = self::get_self_task_id();
+                self::send_handshake(&mut sink, channel_name, Some(&self_task_id)).await?;
+
+                Result::<_, std::io::Error>::Ok(sink)
+            })
+        }))
+            .splice_untyped_ctx(&()),
+        q!(LazySource::new(move || Box::pin(async move {
+            let channel_name = channel_name;
+            let mux = self::get_or_init_channel_mux();
+            let mut rx = mux.register(channel_name.to_owned());
+
+            Result::<_, std::io::Error>::Ok(
+                futures::stream::unfold(rx, |mut rx| {
+                    Box::pin(async move {
+                        let (sender_id, source) = rx.recv().await?;
+                        let from_task_id = sender_id
+                            .expect("m2o sender must provide task ID");
+
+                        debug!(name: "m2o_channel_connected", %from_task_id);
+
+                        Some((
+                            source.map(move |v| {
+                                v.map(|v| (TaglessMemberId::from_container_name(from_task_id.clone()), v))
+                            }),
+                            rx,
+                        ))
+                    })
+                })
+                .flatten_unordered(None),
+            )
+        })))
+            .splice_untyped_ctx(&()),
+    )
+}
+
+pub fn deploy_containerized_m2m(channel_name: &str) -> (syn::Expr, syn::Expr) {
+    (
+        q!(sinktools::demux_map_lazy::<_, _, _, _>(
+            move |key: &TaglessMemberId| {
+                let key = key.clone();
+                let channel_name = channel_name.to_owned();
+
+                LazySink::<_, _, _, bytes::Bytes>::new(move || {
+                    Box::pin(async move {
+                        let task_id = key.get_container_name();
+                        let ip = self::resolve_task_ip(task_id).await;
+                        let target = format!("{}:{}", ip, self::CHANNEL_MUX_PORT);
+                        debug!(name: "connecting", %target, %task_id, channel_name = %channel_name);
+
+                        let stream = self::connect_channel(&target).await?;
+                        let mut sink = FramedWrite::new(stream, LengthDelimitedCodec::new());
+
+                        let self_task_id = self::get_self_task_id();
+                        self::send_handshake(&mut sink, &channel_name, Some(&self_task_id)).await?;
+
+                        Result::<_, std::io::Error>::Ok(sink)
+                    })
+                })
+            }
+        ))
+            .splice_untyped_ctx(&()),
+        q!(LazySource::new(move || Box::pin(async move {
+            let channel_name = channel_name;
+            let mux = self::get_or_init_channel_mux();
+            let mut rx = mux.register(channel_name.to_owned());
+
+            Result::<_, std::io::Error>::Ok(
+                futures::stream::unfold(rx, |mut rx| {
+                    Box::pin(async move {
+                        let (sender_id, source) = rx.recv().await?;
+                        let from_task_id = sender_id.expect("m2m sender must provide task ID");
+
+                        debug!(name: "m2m_channel_connected", %from_task_id);
+
+                        Some((
+                            source.map(move |v| {
+                                v.map(|v| {
+                                    (
+                                        TaglessMemberId::from_container_name(from_task_id.clone()),
+                                        v,
+                                    )
+                                })
+                            }),
+                            rx,
+                        ))
+                    })
+                })
+                .flatten_unordered(None),
+            )
+        })))
+            .splice_untyped_ctx(&()),
+    )
+}
+
+pub fn deploy_containerized_external_sink_source_ident(
+    bind_addr: String,
+    socket_ident: syn::Ident,
+) -> syn::Expr {
+    let socket_ident = SocketIdent { socket_ident };
+
+    q!(LazySinkSource::<
+        _,
+        FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
+        FramedWrite<OwnedWriteHalf, LengthDelimitedCodec>,
+        bytes::Bytes,
+        std::io::Error,
+    >::new(async move {
+        let span = span!(tracing::Level::TRACE, "lazy_sink_source");
+        let guard = span.enter();
+        let bind_addr = bind_addr;
+        trace!(name: "attempting to accept from external", %bind_addr);
+        std::mem::drop(guard);
+        let (stream, peer) = socket_ident.accept().instrument(span.clone()).await?;
+        let guard = span.enter();
+
+        debug!(name: "external accepting", ?peer);
+        let (rx, tx) = stream.into_split();
+
+        let fr = FramedRead::new(rx, LengthDelimitedCodec::new());
+        let fw = FramedWrite::new(tx, LengthDelimitedCodec::new());
+
+        Result::<_, std::io::Error>::Ok((fr, fw))
+    },))
+        .splice_untyped_ctx(&())
+}
+
+pub fn cluster_self_id<'a>() -> impl QuotedWithContext<'a, TaglessMemberId, ()> + Clone + 'a {
+    q!(TaglessMemberId::from_container_name(
+        self::get_self_task_id()
+    ))
+}
+
+pub fn cluster_membership_stream<'a>(
+    location_id: &LocationId,
+) -> impl QuotedWithContext<'a, Box<dyn Stream<Item = (TaglessMemberId, MembershipEvent)> + Unpin>, ()>
+{
+    let location_key = location_id.key();
+
+    q!(Box::new(self::ecs_membership_stream(
+        std::env::var("CLUSTER_NAME").unwrap(),
+        location_key
+    ))
+        as Box<
+            dyn Stream<Item = (TaglessMemberId, MembershipEvent)> + Unpin,
+        >)
+}
+
+#[instrument(skip_all, fields(%cluster_name, %location_key))]
+fn ecs_membership_stream(
+    cluster_name: String,
+    location_key: LocationKey,
+) -> impl Stream<Item = (TaglessMemberId, MembershipEvent)> + Unpin {
+    use std::collections::HashSet;
+
+    use futures::stream::{StreamExt, once};
+
+    trace!(name: "ecs_membership_stream_created", %cluster_name, %location_key);
+
+    let ecs_poller_span = trace_span!("ecs_poller");
+
+    // Task family format: hy-{name_hint}-loc{idx}v{version}
+    // Example: hy-p1-loc2v1
+    let task_definition_arn_parser =
+        regex::Regex::new(r"arn:aws:ecs:(?<region>.*):(?<account_id>.*):task-definition\/(?<container_id>hy-(?<type>[^-]+)-loc(?<location_idx>[0-9]+)v(?<location_version>[0-9]+)(?:-(?<instance_id>.*))?):.*").unwrap();
+
+    let poll_stream = futures::stream::unfold(
+        (HashSet::<String>::new(), cluster_name, location_key),
+        move |(known_tasks, cluster_name, location_key)| {
+            let task_definition_arn_parser = task_definition_arn_parser.clone();
+
+            async move {
+                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let ecs_client = aws_sdk_ecs::Client::new(&config);
+
+                let tasks = match ecs_client.list_tasks().cluster(&cluster_name).send().await {
+                    Ok(tasks) => tasks,
+                    Err(e) => {
+                        trace!(name: "list_tasks_error", error = %e);
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        return Some((Vec::new(), (known_tasks, cluster_name, location_key)));
+                    }
+                };
+
+                let task_arns = tasks.task_arns().to_vec();
+
+                let mut events = Vec::new();
+                let mut current_tasks = HashSet::<String>::new();
+
+                if !task_arns.is_empty() {
+                    let task_details = match ecs_client
+                        .describe_tasks()
+                        .cluster(&cluster_name)
+                        .set_tasks(Some(task_arns.clone()))
+                        .send()
+                        .await
+                    {
+                        Ok(details) => details,
+                        Err(e) => {
+                            trace!(name: "describe_tasks_error", error = %e);
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            return Some((Vec::new(), (known_tasks, cluster_name, location_key)));
+                        }
+                    };
+
+                    for task in task_details.tasks() {
+                        let Some(last_status) = task.last_status() else {
+                            continue;
+                        };
+
+                        if last_status != "RUNNING" {
+                            continue;
+                        }
+
+                        let Some(task_def_arn) = task.task_definition_arn() else {
+                            continue;
+                        };
+
+                        let Some(captures) = task_definition_arn_parser.captures(task_def_arn)
+                        else {
+                            continue;
+                        };
+
+                        let Some(location_idx) = captures.name("location_idx") else {
+                            continue;
+                        };
+                        let Some(location_version) = captures.name("location_version") else {
+                            continue;
+                        };
+                        // Reconstruct the location key string and parse it
+                        let location_key_str =
+                            format!("loc{}v{}", location_idx.as_str(), location_version.as_str());
+                        let task_location_key: LocationKey = match location_key_str.parse() {
+                            Ok(key) => key,
+                            Err(_) => {
+                                continue;
+                            }
+                        };
+
+                        // Filter by location_id - only include tasks for this specific cluster
+                        if task_location_key != location_key {
+                            continue;
+                        }
+
+                        // Extract task ID from task ARN (last segment after final /)
+                        // Task ARN format: arn:aws:ecs:region:account:task/cluster-name/task-id
+                        let Some(task_arn) = task.task_arn() else {
+                            continue;
+                        };
+                        let Some(task_id) = task_arn.rsplit('/').next() else {
+                            continue;
+                        };
+
+                        // Use task_id as the member identifier
+                        current_tasks.insert(task_id.to_owned());
+                        if !known_tasks.contains(task_id) {
+                            trace!(name: "task_joined", %task_id);
+                            events.push((task_id.to_owned(), MembershipEvent::Joined));
+                        }
+                    }
+                }
+
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "nondeterministic iteration order, container events are not deterministically ordered"
+                )]
+                for task_id in known_tasks.iter() {
+                    if !current_tasks.contains(task_id) {
+                        trace!(name: "task_left", %task_id);
+                        events.push((task_id.to_owned(), MembershipEvent::Left));
+                    }
+                }
+
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                Some((events, (current_tasks, cluster_name, location_key)))
+            }
+                .instrument(ecs_poller_span.clone())
+        },
+    )
+        .flat_map(futures::stream::iter);
+
+    Box::pin(
+        poll_stream
+            .map(|(k, v)| (TaglessMemberId::from_container_name(k), v))
+            .inspect(|(member_id, event)| trace!(name: "membership_event", ?member_id, ?event)),
+    )
+}
+
+/// Resolve a task ID to its private IP address via ECS API.
+async fn resolve_task_ip(task_id: &str) -> String {
+    let cluster_name = std::env::var("CLUSTER_NAME").unwrap();
+
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let ecs_client = aws_sdk_ecs::Client::new(&config);
+
+    loop {
+        let tasks = match ecs_client.list_tasks().cluster(&cluster_name).send().await {
+            Ok(t) => t,
+            Err(e) => {
+                trace!(name: "resolve_ip_list_error", %task_id, error = %e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let task_arns: Vec<_> = tasks.task_arns().to_vec();
+        if task_arns.is_empty() {
+            trace!(name: "resolve_ip_no_tasks", %task_id);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        }
+
+        let task_details = match ecs_client
+            .describe_tasks()
+            .cluster(&cluster_name)
+            .set_tasks(Some(task_arns))
+            .send()
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                trace!(name: "resolve_ip_describe_error", %task_id, error = %e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        // Find the task with matching task ID
+        for task in task_details.tasks() {
+            let Some(task_arn) = task.task_arn() else {
+                continue;
+            };
+            let current_task_id = task_arn.rsplit('/').next().unwrap_or_default();
+
+            if current_task_id == task_id
+                && let Some(ip) = task
+                .attachments()
+                .iter()
+                .flat_map(|a| a.details())
+                .find(|d| d.name() == Some("privateIPv4Address"))
+                .and_then(|d| d.value())
+            {
+                trace!(name: "resolved_ip", %task_id, %ip);
+                return ip.to_owned();
+            }
+        }
+
+        trace!(name: "resolve_ip_not_found", %task_id);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Resolve a task family name to its task ID via ECS API.
+/// Used for process-to-process connections where the target is known by task family at compile time.
+async fn resolve_task_family_to_task_id(task_family: &str) -> String {
+    let cluster_name = std::env::var("CLUSTER_NAME").unwrap();
+
+    let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+    let ecs_client = aws_sdk_ecs::Client::new(&config);
+
+    loop {
+        let tasks = match ecs_client
+            .list_tasks()
+            .cluster(&cluster_name)
+            .family(task_family)
+            .send()
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                trace!(name: "resolve_family_list_error", %task_family, error = %e);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+
+        let Some(task_arn) = tasks.task_arns().first() else {
+            trace!(name: "resolve_family_no_task", %task_family);
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+
+        // Extract task ID from ARN
+        let task_id = task_arn.rsplit('/').next().unwrap_or_default();
+        if !task_id.is_empty() {
+            trace!(name: "resolved_task_id", %task_family, %task_id);
+            return task_id.to_owned();
+        }
+
+        trace!(name: "resolve_family_invalid_arn", %task_family, %task_arn);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Parse the ECS task ID from a metadata URI.
+///
+/// URI format: `http://169.254.170.2/v4/{task_id}-{runtime_id}`
+/// where `task_id` is 32 hex chars and `runtime_id` is a numeric suffix.
+fn parse_task_id_from_metadata_uri(metadata_uri: &str) -> Option<String> {
+    let re = regex::Regex::new(r"/v4/(?P<task_id>[0-9a-f]{32})-\d+$").unwrap();
+    re.captures(metadata_uri)
+        .and_then(|c| c.name("task_id"))
+        .map(|m| m.as_str().to_owned())
+}
+
+fn get_self_task_id() -> String {
+    let metadata_uri = std::env::var("ECS_CONTAINER_METADATA_URI_V4")
+        .expect("ECS_CONTAINER_METADATA_URI_V4 not set - are we running in ECS?");
+    parse_task_id_from_metadata_uri(&metadata_uri).unwrap_or_else(|| {
+        panic!("ECS_CONTAINER_METADATA_URI_V4 does not match expected format /v4/{{task_id}}-{{runtime_id}}: {metadata_uri}")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_task_id_from_metadata_uri() {
+        let uri = "http://169.254.170.2/v4/01234567890abcdef01234567890abcd-123456789";
+        assert_eq!(
+            parse_task_id_from_metadata_uri(uri),
+            Some("01234567890abcdef01234567890abcd".to_owned())
+        );
+    }
+
+    #[test]
+    fn test_parse_task_id_invalid_uri() {
+        assert_eq!(
+            parse_task_id_from_metadata_uri("http://169.254.170.2/v4/tooshort-123"),
+            None
+        );
+        assert_eq!(
+            parse_task_id_from_metadata_uri(
+                "http://169.254.170.2/v3/01234567890abcdef01234567890abcd-123"
+            ),
+            None
+        );
+        assert_eq!(parse_task_id_from_metadata_uri(""), None);
+    }
+}

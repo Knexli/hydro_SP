@@ -3,11 +3,14 @@
 #[cfg(any(feature = "deploy", feature = "sim", feature = "deploy_integration"))]
 pub(crate) mod deploy_runtime;
 
-#[cfg(any(feature = "docker_runtime", feature = "ecs_runtime"))]
+#[cfg(any(feature = "docker_runtime", feature = "ecs_runtime", feature = "knative_runtime"))]
 pub mod deploy_runtime_containerized;
 
 #[cfg(feature = "ecs_runtime")]
 pub mod deploy_runtime_containerized_ecs;
+
+#[cfg(feature = "knative_runtime")]
+pub mod deploy_runtime_containerized_knative;
 
 #[cfg(any(feature = "maelstrom", feature = "maelstrom_runtime"))]
 pub mod maelstrom;
@@ -50,7 +53,6 @@ pub use deploy_graph_containerized_ecs::*;
 #[cfg(stageleft_runtime)]
 #[cfg(feature = "knative_deploy")]
 pub mod deploy_graph_containerized_knative;
-
 #[cfg(stageleft_runtime)]
 #[cfg(feature = "knative_deploy")]
 pub use deploy_graph_containerized_knative::*;
