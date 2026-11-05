@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
+use axum::Router;
+use tokio::sync::Notify;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
 use sinktools::lazy::{LazySink, LazySource};
@@ -36,13 +38,42 @@ type Mailbox = (
     Mutex<Option<mpsc::Receiver<BytesMut>>>,
 );
 
+// All of these variables are shared within one running process instance.
 static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
+static APPLICATION_ROUTER: OnceLock<Router> = OnceLock::new();
+static ROUTER_READY: Notify = Notify::const_new();
 
 fn mailbox() -> &'static Mailbox {
     MAILBOX.get_or_init(|| {
         let (tx, rx) = mpsc::channel(64);
         (tx, Mutex::new(Some(rx)))
     })
+}
+
+/// This method will be called by an application code that wants to register its own routes (e.g., to expose its own HTTP endpoints to external clients in Knative serving).
+pub fn register_application_router(router: Router) {
+    if APPLICATION_ROUTER.set(router).is_err() {
+        panic!("Application router already registered");
+    }
+
+    ROUTER_READY.notify_waiters();
+}
+
+async fn application_router() -> Router {
+    loop {
+        let notified = ROUTER_READY.notified();
+        tokio::pin!(notified);
+
+        // Register the waiter before checking the value.
+        // This avoids missing a notification.
+        notified.as_mut().enable();
+
+        if let Some(router) = APPLICATION_ROUTER.get() {
+            return router.clone();
+        }
+
+        notified.await;
+    }
 }
 
 // Called by the application's Axum HTTP handler.
@@ -199,6 +230,29 @@ pub fn deploy_containerized_o2o(
 //             .splice_untyped_ctx(&()),
 //     )
 // }
+
+pub async fn serve_process_http(
+    expects_application_router: bool,
+) -> std::io::Result<()> {
+    let app_router = if expects_application_router {
+        application_router().await
+    } else {
+        Router::new()
+    };
+
+    let router = app_router.merge(knative_router::<()>());
+
+    let listener = tokio::net::TcpListener::bind(
+        "0.0.0.0:8080"
+    ).await?;
+
+    eprintln!("Knative HTTP server listening on 0.0.0.0:8080");
+
+    // Runs until shutdown or an unrecoverable server error.
+    axum::serve(listener, router).await?;
+
+    Ok(())
+}
 
 pub fn deploy_containerized_o2m(channel_name: &str) -> (syn::Expr, syn::Expr) {
     (

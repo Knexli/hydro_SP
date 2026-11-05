@@ -103,6 +103,8 @@ pub struct KnativeDeployProcess {
 
     trybuild_config:
         Rc<RefCell<Option<(String, crate::compile::trybuild::generate::TrybuildConfig)>>>,
+
+    expects_application_router: bool,
 }
 
 impl Node for KnativeDeployProcess {
@@ -135,10 +137,24 @@ impl Node for KnativeDeployProcess {
         sidecars: &[syn::Expr],
         as_code_options: &AsCodeOptions,
     ) {
+        let mut generated_sidecars = sidecars.to_vec();
+
+        let expects_application_router = self.expects_application_router;
+
+        let http_server_sidecar: syn::Expr = syn::parse_quote! {
+            async move {
+                hydro_lang::deploy::deploy_runtime_containerized_knative::serve_process_http(#expects_application_router)
+                .await
+                .expect("Knative HTTP server failed");
+            }
+        };
+
+        generated_sidecars.push(http_server_sidecar);
+
         let (bin_name, config) = create_graph_trybuild(
             graph,
             extra_stmts,
-            sidecars,
+            &generated_sidecars,
             as_code_options,
             Some(&self.name),
             crate::compile::trybuild::generate::DeployMode::Containerized,
@@ -362,7 +378,9 @@ impl KnativeDeploy {
 
     /// Add an internal ecs process to the deployment.
     pub fn add_knative_process(&mut self) -> KnativeDeployProcessSpec {
-        KnativeDeployProcessSpec
+        KnativeDeployProcessSpec {
+            expects_application_router: false,
+        }
     }
 
     /// Add an internal ecs cluster to the deployment.
@@ -903,7 +921,16 @@ fn get_ecs_image_name(name_hint: &str, location: LocationKey) -> String {
 
 /// Represents a Process running in an ecs deployment
 #[derive(Clone)]
-pub struct KnativeDeployProcessSpec;
+pub struct KnativeDeployProcessSpec {
+    expects_application_router: bool,
+}
+
+impl KnativeDeployProcessSpec {
+    pub fn with_application_http(mut self) -> Self {
+        self.expects_application_router = true;
+        self
+    }
+}
 
 impl<'a> ProcessSpec<'a, KnativeDeploy> for KnativeDeployProcessSpec {
     #[instrument(level = "trace", skip_all, fields(%id, %name_hint))]
@@ -914,6 +941,7 @@ impl<'a> ProcessSpec<'a, KnativeDeploy> for KnativeDeployProcessSpec {
             next_port: Rc::new(RefCell::new(10001)),
             exposed_ports: Rc::new(RefCell::new(BTreeMap::new())),
             trybuild_config: Rc::new(RefCell::new(None)),
+            expects_application_router: self.expects_application_router,
         }
     }
 }
