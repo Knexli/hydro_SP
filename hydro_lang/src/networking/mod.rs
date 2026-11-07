@@ -273,6 +273,11 @@ pub struct Udp<F> {
     _phantom: PhantomData<F>,
 }
 
+/// Send items across a HTTP channel via Knative serving, which does not guarantee delivery or ordering.
+pub struct Http<F> {
+    _phantom: PhantomData<F>,
+}
+
 #[sealed::sealed]
 impl<F: UdpFailPolicy> TransportKind for Udp<F> {
     type OrderingGuarantee = NoOrder;
@@ -282,6 +287,18 @@ impl<F: UdpFailPolicy> TransportKind for Udp<F> {
     fn networking_info() -> NetworkingInfo {
         NetworkingInfo::Udp {
             fault: F::udp_fault(),
+        }
+    }
+}
+
+#[sealed::sealed]
+impl TransportKind for Http<Lossy> {
+    type OrderingGuarantee = NoOrder;
+    type ConsistencyGuarantee = NoConsistency;
+
+    fn networking_info() -> NetworkingInfo {
+        NetworkingInfo::Http {
+            fault: HttpFault::Lossy
         }
     }
 }
@@ -351,6 +368,18 @@ pub enum UdpFault {
     LossyDelayedForever,
 }
 
+/// The fault model for a HTTP channel (same semantics as lossy UDP channel).
+///
+/// HTTP via Knative is connectionless and never guarantees delivery (pods might fail with queued requests and might be arbitrarly distributed), so there is no
+/// `FailStop` variant — messages can always be dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum HttpFault {
+    /// Messages may be lost (e.g. due to network partitions or congestion).
+    Lossy,
+    // Dropped messages are treated as indefinitely delayed.
+    // LossyDelayedForever,
+}
+
 /// Describes the networking configuration for a network channel at the IR level.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub enum NetworkingInfo {
@@ -374,6 +403,11 @@ pub enum NetworkingInfo {
         /// missing (`NoConsistency`), or must not (`EventualConsistency`).
         consistency: crate::location::dynamic::ClusterConsistency,
     },
+    /// A HTTP-based network channel used in Knative with the same fault model as UDP.
+    Http {
+        /// The fault model for this HTTP channel.
+        fault: HttpFault,
+    }
 }
 
 /// A network channel configuration with `T` as transport backend and `S` as the serialization
@@ -544,6 +578,23 @@ impl<S: ?Sized> NetworkingConfig<Udp<()>, S> {
     }
 }
 
+impl<S: ?Sized> NetworkingConfig<Http<()>, S> {
+    /// Configures the HTTP transport to allow messages to be lost.
+    ///
+    /// see UDP
+    ///
+    /// # Non-Determinism
+    /// A lossy UDP channel will non-deterministically drop messages during execution.
+    #[must_use]
+    pub const fn lossy(self, nondet: NonDet) -> NetworkingConfig<Http<Lossy>, S> {
+        let _ = nondet;
+        NetworkingConfig {
+            name: self.name,
+            _phantom: (PhantomData, PhantomData),
+        }
+    }
+}
+
 #[sealed::sealed]
 impl<Tr, S, T: ?Sized> NetworkFor<T> for NetworkingConfig<Tr, S>
 where
@@ -642,6 +693,12 @@ pub const EMBEDDED: NetworkingConfig<EmbeddedTransport<()>, Embedded> = Networki
 /// simulator will not actually drop packets—it delays "dropped" messages until the
 /// end of the execution, which catches safety bugs but cannot test liveness.
 pub const UDP: NetworkingConfig<Udp<()>, NoSer> = NetworkingConfig {
+    name: None,
+    _phantom: (PhantomData, PhantomData),
+};
+
+/// Used for Knative with same semantics as UDP (see above).
+pub const HTTP: NetworkingConfig<Http<()>, NoSer> = NetworkingConfig {
     name: None,
     _phantom: (PhantomData, PhantomData),
 };

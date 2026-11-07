@@ -116,7 +116,7 @@ pub fn http_sink(
                 .await
                 .map_err(|error| {
                     eprintln!("[Hydro sender] HTTP error: {error}");
-                    std::io::Error::other(error)
+                    io::Error::other(error)
                 })?;
 
             eprintln!(
@@ -126,7 +126,7 @@ pub fn http_sink(
 
             response
                 .error_for_status()
-                .map_err(std::io::Error::other)?;
+                .map_err(io::Error::other)?;
 
             Ok::<_, io::Error>((client, url))
         },
@@ -134,7 +134,7 @@ pub fn http_sink(
 }
 
 pub async fn handle_hydro_receive(
-    body: axum::body::Bytes,
+    body: Bytes,
 ) -> axum::http::StatusCode {
     eprintln!(
         "Archive HTTP receiver got {} bytes", body.len()
@@ -146,11 +146,11 @@ pub async fn handle_hydro_receive(
     }
 }
 
-pub fn knative_router<S>() -> axum::Router<S>
+pub fn knative_router<S>() -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    axum::Router::new().route(
+    Router::new().route(
         "/_hydro/receive",
         axum::routing::post(handle_hydro_receive),
     )
@@ -233,7 +233,7 @@ pub fn deploy_containerized_o2o(
 
 pub async fn serve_process_http(
     expects_application_router: bool,
-) -> std::io::Result<()> {
+) -> io::Result<()> {
     let app_router = if expects_application_router {
         application_router().await
     } else {

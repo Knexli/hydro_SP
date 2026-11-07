@@ -2406,6 +2406,19 @@ impl DfirBuilder for SimBuilder {
                 }
                 _ => todo!("SimBuilder only supports lossy-delayed-forever UDP networking"),
             },
+            NetworkingInfo::Http { fault } => match fault {
+                _ => todo!("SimBuilder does not yet support HTTP networking"),
+                // HttpFault::Lossy => {
+                //     assert!(
+                //         self.test_safety_only,
+                //         "[DO NOT TRUST THIS DESCRIPTION, IT WAS JUST COPIED FROM UDP] Simulating `Lossy` requires `.test_safety_only()` on the \
+                //          SimFlow because the simulator models dropped messages as indefinitely \
+                //          delayed, which only tests safety (not liveness). Call \
+                //          `.sim().test_safety_only()` to opt in."
+                //     );
+                // }
+                // _ => todo!("SimBuilder only supports lossy-delayed-forever UDP networking"),
+            },
             // An `EMBEDDED` channel is simulated by the guarantees it declares: ordered and
             // eventually consistent like a fail-stop TCP channel, or unordered and eventually
             // consistent like a lossy-delayed-forever one.

@@ -17,7 +17,6 @@ use syn::parse_quote;
 use tracing::{instrument, trace};
 
 use crate::deploy::deploy_graph_containerized::build_and_create_image;
-use dfir_rs::dfir_pipes::pull::Pull;
 use hydro_deploy::{LinuxCompileType, RustCrate};
 use std::fs;
 use std::path::PathBuf;
@@ -393,6 +392,7 @@ impl KnativeDeploy {
         KnativeDeployExternalSpec { name }
     }
 
+    /// Generate deployment files.
     pub async fn generate_deploy_files(
         &self,
         nodes: &DeployResult<'_, Self>,
@@ -405,14 +405,14 @@ impl KnativeDeploy {
             .next()
             .ok_or("no processes to deploy")?;
 
-        let mut deployment_dir = PathBuf::from(&first_process.build.project_dir).join("deploy");
+        let deployment_dir = PathBuf::from(&first_process.build.project_dir).join("deploy");
 
-        if (deployment_dir.exists()) {
+        if deployment_dir.exists() {
             fs::remove_dir_all(&deployment_dir)?;
         }
         fs::create_dir_all(&deployment_dir)?;
 
-        for (process) in manifest.processes.values() {
+        for process in manifest.processes.values() {
             let process_dir = deployment_dir.join(&process.task_family);
 
             fs::create_dir_all(&process_dir)?;
@@ -589,12 +589,12 @@ impl<'a> Deploy<'a> for KnativeDeploy {
         networking_info: &crate::networking::NetworkingInfo,
         _external_types: Option<(&syn::Type, &syn::Type)>,
     ) -> (syn::Expr, syn::Expr) {
-        // match networking_info {
-        //     crate::networking::NetworkingInfo::Tcp {
-        //         fault: crate::networking::TcpFault::FailStop,
-        //     } => {}
-        //     _ => panic!("Unsupported networking info: {:?}", networking_info),
-        // }
+        match networking_info {
+            crate::networking::NetworkingInfo::Http {
+                fault: crate::networking::HttpFault::Lossy,
+            } => {}
+            _ => panic!("Unsupported networking info: {:?}", networking_info),
+        }
         let target_url = resolve_knative_url(&p2.name);
         let channel_name = if name.is_some() {
             name.unwrap()
@@ -926,6 +926,7 @@ pub struct KnativeDeployProcessSpec {
 }
 
 impl KnativeDeployProcessSpec {
+    /// Specifies that the process expects to receive HTTP traffic from the application router.
     pub fn with_application_http(mut self) -> Self {
         self.expects_application_router = true;
         self
