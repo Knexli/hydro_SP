@@ -566,9 +566,9 @@ fn build_info_from_config(
     }
 }
 
-fn resolve_knative_url(service_name: &str) -> String {
+fn resolve_knative_url(service_name: &str, channel_name: &str) -> String {
     // format!("http://{service_name}.default.svc.cluster.local")
-    format!("http://{service_name}.default.svc.cluster.local/_hydro/receive")
+    format!("http://{service_name}.default.svc.cluster.local/_hydro/receive/{channel_name}")
 }
 
 impl<'a> Deploy<'a> for KnativeDeploy {
@@ -595,16 +595,30 @@ impl<'a> Deploy<'a> for KnativeDeploy {
             } => {}
             _ => panic!("Unsupported networking info: {:?}", networking_info),
         }
-        let target_url = resolve_knative_url(&p2.name);
-        let channel_name = if name.is_some() {
-            name.unwrap()
-        } else {
-            // String::from("placeholder_name")
-            "placeholder_name"
+
+        let channel_name = match name {
+            Some(user_name) => {
+                assert!(
+                    !user_name.starts_with("__"),
+                    "User-defined channel names must not start with '__': {user_name}"
+                );
+
+                user_name.to_owned()
+            }
+
+            None => format!(
+                "__{}_{}_{}_{}",
+                p1.name,
+                p1_port,
+                p2.name,
+                p2_port
+            ),
         };
+
+        let target_url = resolve_knative_url(&p2.name, &channel_name);
         deploy_containerized_o2o(
             &target_url,
-            &channel_name, // todo channel names later
+            &channel_name,
         )
     }
 

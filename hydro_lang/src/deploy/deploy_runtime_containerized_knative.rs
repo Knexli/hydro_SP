@@ -7,10 +7,15 @@
 use std::time::Duration;
 use std::io;
 use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
 
 use bytes::{Bytes, BytesMut};
 use tokio::sync::mpsc;
-use axum::Router;
+use axum::{
+    Router,
+    extract::Path,
+    http::StatusCode,
+};
 use tokio::sync::Notify;
 
 use futures::{Sink, SinkExt, Stream, StreamExt};
@@ -37,6 +42,35 @@ type Mailbox = (
     mpsc::Sender<BytesMut>,
     Mutex<Option<mpsc::Receiver<BytesMut>>>,
 );
+
+// One registry per running Rust process. Maps channel names to mpsc senders.
+type ChannelRegistry = Mutex<HashMap<String, mpsc::Sender<BytesMut>>>;
+
+static CHANNELS: OnceLock<ChannelRegistry> = OnceLock::new();
+
+fn channels() -> &'static ChannelRegistry {
+    CHANNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_channel(
+    channel_name: &str,
+) -> io::Result<mpsc::Receiver<BytesMut>> {
+    let mut registry = channels().lock().unwrap();
+
+    if registry.contains_key(channel_name) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("Channel already registered: {channel_name}"),
+        ));
+    }
+
+    // Create a queue dedicated to this Hydro channel.
+    let (tx, rx) = mpsc::channel(64);
+
+    registry.insert(channel_name.to_owned(), tx);
+
+    Ok(rx)
+}
 
 // All of these variables are shared within one running process instance.
 static MAILBOX: OnceLock<Mailbox> = OnceLock::new();
@@ -77,23 +111,23 @@ async fn application_router() -> Router {
 }
 
 // Called by the application's Axum HTTP handler.
-pub async fn receive_http(body: Bytes) -> Result<(), ()> {
-    mailbox()
-        .0
-        .send(BytesMut::from(body.as_ref()))
-        .await
-        .map_err(|_| ())
-}
+// pub async fn receive_http(body: Bytes) -> Result<(), ()> {
+//     mailbox()
+//         .0
+//         .send(BytesMut::from(body.as_ref()))
+//         .await
+//         .map_err(|_| ())
+// }
 
 // Called by the generated Hydro receiving source.
-pub fn take_http_receiver() -> io::Result<mpsc::Receiver<BytesMut>> {
-    mailbox()
-        .1
-        .lock()
-        .unwrap()
-        .take()
-        .ok_or_else(|| io::Error::other("HTTP receiver already taken"))
-}
+// pub fn take_http_receiver() -> io::Result<mpsc::Receiver<BytesMut>> {
+//     mailbox()
+//         .1
+//         .lock()
+//         .unwrap()
+//         .take()
+//         .ok_or_else(|| io::Error::other("HTTP receiver already taken"))
+// }
 
 pub fn http_sink(
     url: String,
@@ -134,15 +168,27 @@ pub fn http_sink(
 }
 
 pub async fn handle_hydro_receive(
+    Path(channel_name): Path<String>,
     body: Bytes,
 ) -> axum::http::StatusCode {
     eprintln!(
-        "Archive HTTP receiver got {} bytes", body.len()
+        "HTTP receiver got {} bytes on channel {}", body.len(), channel_name
     );
 
-    match receive_http(body).await {
-        Ok(()) => axum::http::StatusCode::ACCEPTED,
-        Err(()) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    // Find the channel's sender.
+    let tx = {
+        let registry = channels().lock().unwrap();
+        registry.get(&channel_name).cloned()
+    };
+
+    let Some(tx) = tx else {
+        return StatusCode::NOT_FOUND;
+    };
+
+    // Deliver the message to the corresponding Hydro source.
+    match tx.send(BytesMut::from(body.as_ref())).await {
+        Ok(()) => StatusCode::ACCEPTED,
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
 }
 
@@ -151,7 +197,7 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new().route(
-        "/_hydro/receive",
+        "/_hydro/receive/{channel_name}",
         axum::routing::post(handle_hydro_receive),
     )
 }
@@ -160,7 +206,6 @@ pub fn deploy_containerized_o2o(
     target_url: &str,
     channel_name: &str,
 ) -> (syn::Expr, syn::Expr) {
-    // channel_name ignored for now (this means that the target will not be able to distinguish where the message is coming form)
     (
         // Sender: serialized Hydro bytes -> HTTP POST.
         q!(LazySink::<_, _, _, bytes::Bytes>::new(
@@ -176,7 +221,9 @@ pub fn deploy_containerized_o2o(
         // Receiver: queue -> Hydro stream.
         q!(LazySource::new(
             move || Box::pin(async move {
-                let rx = self::take_http_receiver()?;
+                let channel_name = channel_name;
+
+                let rx = self::register_channel(channel_name)?;
 
                 let source =
                     tokio_stream::wrappers::ReceiverStream::new(rx)
