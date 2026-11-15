@@ -49,6 +49,8 @@ serde_json = { version = "1.0.115", optional = true }
 slotmap = { version = "1.1.0", default-features = false }
 syn = { version = "2.0.46", features = [ "extra-traits", "full", "parsing", "visit-mut" ], optional = true }
 webbrowser = { version = "1.0.3", optional = true }
+redis = { version = "1", features = ["tokio-comp"] }
+
 
 # coax cargo-smart-release into publishing this crate.
 # https://github.com/hydro-project/hydro/blob/main/RELEASING.md#addendum-adding-new-crates

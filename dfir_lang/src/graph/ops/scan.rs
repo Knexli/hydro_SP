@@ -68,6 +68,8 @@ pub const SCAN: OperatorConstraints = OperatorConstraints {
                    inputs,
                    outputs,
                    arguments,
+                   df_ident,
+                   node_id,
                    ..
                },
                diagnostics| {
@@ -87,19 +89,56 @@ pub const SCAN: OperatorConstraints = OperatorConstraints {
         let result_ident = wc.make_ident("result");
         let state_ident = wc.make_ident("scan_state");
 
-        let write_prologue = quote_spanned! {op_span=>
-            #[allow(unused_mut, reason = "for if `Fn` instead of `FnMut`.")]
-            let mut #initializer_func_ident = #init_fn;
+        let redis_client_ident = wc.make_ident("redis_client");
+        let redis_key_ident = wc.make_ident("redis_key");
+        let init_serialized_ident = wc.make_ident("init_serialized");
+        let redis_init_once_ident = wc.make_ident("redis_init_once");
+        let redis_state_type_ident = wc.make_ident("redis_state_type");
+        let redis_record_type_ident = wc.make_ident("redis_record_type");
 
-            #[allow(clippy::redundant_closure_call)]
-            let mut #singleton_output_ident = Some(#init);
+        let redis_key = format!("hydro:scan:{}:{:?}", df_ident, node_id);
+
+        let write_prologue = quote_spanned! {op_span=>
+            // Represents the state of the scan.
+            #[derive(#root::serde::Serialize, #root::serde::Deserialize)]
+            enum #redis_state_type_ident<A> {
+                Active(A),
+                Terminated,
+            }
+
+            // Include a revision to distinguish individual updates.
+            #[derive(#root::serde::Serialize, #root::serde::Deserialize)]
+            struct #redis_record_type_ident<A> {
+                revision: u64,
+                state: #redis_state_type_ident<A>,
+            }
+
+             #[allow(unused_mut, reason = "for if `Fn` instead of `FnMut`.")]
+            let mut #initializer_func_ident = std::sync::Arc::new(#init_fn);
+
+            // We initialize only on the first call of write_iterator, as we cannot have blocking calls here
+            // let initVal = #init;
+
+            // let #init_serialized_ident = serde_json::to_string(&initVal).expect("Failed to serialize scan accumulator");
+
+            let redis_url = "redis://redis.default.svc.cluster.local:6379/".to_string();
+
+            let #redis_client_ident = #root::redis::Client::open(redis_url).expect("Invalid Redis URL");
+
+            let #redis_key_ident = #redis_key.to_string();
+
+            let #redis_init_once_ident = std::sync::Arc::new(#root::tokio::sync::OnceCell::<()>::new());
+
+            //
+            // #[allow(unused_mut, reason = "for if `Fn` instead of `FnMut`.")]
+            // let mut #initializer_func_ident = #init_fn;
+            //
+            // #[allow(clippy::redundant_closure_call)]
+            // let mut #singleton_output_ident = Some(#init);
         };
 
         let write_tick_end = match persistence {
-            super::Persistence::Tick => quote_spanned! {op_span=>
-                #[allow(clippy::redundant_closure_call)]
-                { #singleton_output_ident = Some(#init); }
-            },
+            super::Persistence::Tick => panic!("Do not support tick persistence for scan in serverless environment at the moment"),
             _ => Default::default(),
         };
 
@@ -131,23 +170,63 @@ pub const SCAN: OperatorConstraints = OperatorConstraints {
             let #result_ident = call_scan_fn(&mut *#state_ident, #iterator_item_ident, #func);
         };
 
-        let filter_map_body = quote_spanned! {op_span=>
-            #assign_accum_ident
-            #iterator_foreach
-            #result_ident
+        let filter_map_async_body = quote_spanned! {op_span=>
+            #[inline(always)]
+            async fn call_scan_redis_fn<Accum, Item, Output, Init>(
+                client: #root::redis::Client,
+                key: String,
+                init_once: std::sync::Arc<#root::tokio::sync::OnceCell<()>>,
+                init_fn: std::sync::Arc<Init>,
+                item: Item,
+                func: impl Fn(&mut Accum, Item) -> Option<Output>,
+            ) -> Option<Output>
+            where
+                Accum: #root::serde::Serialize + #root::serde::de::DeserializeOwned,
+                Item: Clone,
+                Init: Fn() -> Accum,
+            {
+                init_once.get_or_try_init(|| async {
+                    let initial_value: Accum = init_fn(); // note that we do not consider async initialize or step functions
+
+                    let record = #redis_record_type_ident {
+                        revision: 0,
+                        state: #redis_state_type_ident::Active(initial_value),
+                    };
+
+                    let serialized = #root::serde_json::to_vec(&record).expect("Failed to serialize scan accumulator");
+
+                    let mut conn = client.get_multiplexed_async_connection().await?;
+
+                    let initialized: Option<String> = #root::redis::cmd("SET").arg(&key).arg(&serialized).arg("NX").query_async(&mut conn).await?;
+
+                    println!("Initialized key {}: {}", key, initialized.is_some());
+
+                    Ok::<(), #root::redis::RedisError>(())
+                }).await.expect("Redis scan initialization failed");
+
+                println!("Here we would actually do the next step, which is not implemented yet");
+
+                // TODO: IMPLEMENT THE ACTUAL UPDATE STEP IN A LOOP
+                None
+            }
+
+            // let #state_ident = &mut #singleton_output_ident;
+
+            #[allow(clippy::redundant_closure_call)]
+            call_scan_redis_fn(#redis_client_ident.clone(), #redis_key_ident.clone(), #redis_init_once_ident.clone(), #initializer_func_ident.clone(), #iterator_item_ident, #func)
         };
 
         let write_iterator = if is_pull {
             quote_spanned! {op_span=>
-                let #ident = #root::dfir_pipes::pull::Pull::filter_map(#input, |#iterator_item_ident| {
-                    #filter_map_body
+                let #ident = #root::dfir_pipes::pull::Pull::filter_map_async(#input, |#iterator_item_ident| {
+                    #filter_map_async_body
                 });
             }
         } else {
             let output = &outputs[0];
             quote_spanned! {op_span=>
-                let #ident = #root::dfir_pipes::push::filter_map(|#iterator_item_ident| {
-                    #filter_map_body
+                let #ident = #root::dfir_pipes::push::filter_map_async(|#iterator_item_ident| {
+                    #filter_map_async_body
                 }, #output);
             }
         };

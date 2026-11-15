@@ -1907,6 +1907,9 @@ where
         R: IsExactlyOnce,
         I: Fn() -> A + 'a,
         F: Fn(&mut A, T) -> Option<U> + 'a,
+        // Bounds we require additionally for Redis. We want to be able to serialize and deserialize the accumulator for storing it in Redis KV, and we need to be able to clone the passed item of type T in case we need to retry the update in case CAS fails.
+        A: serde::Serialize + serde::de::DeserializeOwned,
+        T: Clone,
     {
         let init = crate::handoff_ref::with_ref_capture(|| {
             init.splice_fn0_ctx(&OperatorContext::<L, B>::new(&self.location))

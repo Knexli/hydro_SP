@@ -24,7 +24,7 @@ pub mod util;
 pub use ::{
     bincode, bumpalo, bytes, dfir_lang, dfir_lang as lang, dfir_pipes, futures, lattices,
     pin_project_lite, rustc_hash, serde, serde_json, sinktools, slotmap, tracing, variadics,
-    web_time,
+    web_time, redis,
 };
 #[cfg(feature = "tokio")]
 pub use ::{tokio, tokio_stream, tokio_util};
