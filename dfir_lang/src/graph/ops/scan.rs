@@ -193,7 +193,7 @@ pub const SCAN: OperatorConstraints = OperatorConstraints {
                         state: #redis_state_type_ident::Active(initial_value),
                     };
 
-                    let serialized = #root::serde_json::to_vec(&record).expect("Failed to serialize scan accumulator");
+                    let serialized: Vec<u8> = #root::serde_json::to_vec(&record).expect("Failed to serialize scan accumulator");
 
                     let mut conn = client.get_multiplexed_async_connection().await?;
 
@@ -205,6 +205,43 @@ pub const SCAN: OperatorConstraints = OperatorConstraints {
                 }).await.expect("Redis scan initialization failed");
 
                 println!("Here we would actually do the next step, which is not implemented yet");
+
+                let mut conn = client.get_multiplexed_async_connection().await.expect("Redis connection failed");
+
+                loop {
+                    let bytes_wrapped: Option<Vec<u8>> = #root::redis::cmd("GET").arg(&key).query_async(&mut conn).await.unwrap_or_else(|err| {
+                        panic!("Redis GET failed for key {}: {}", key, err)
+                    });
+
+                    let bytes: Vec<u8> = bytes_wrapped.unwrap_or_else(|| {
+                        panic!("Redis key {} not found, must have been deleted while still in use", key);
+                    });
+
+                    let mut record: #redis_record_type_ident<Accum> = #root::serde_json::from_slice(&bytes).expect("Failed to deserialize Redis accumulator");
+
+                    match &mut record.state {
+                        #redis_state_type_ident::Active(accumulator) => {
+                            let next_val: Option<Output> = func(accumulator, item.clone());
+                            if (next_val.is_none()) {
+                                // terminate stream
+                                record.state = #redis_state_type_ident::Terminated;
+                            } // otherwise the accumulator is modified directly
+                            record.revision += 1;
+                            let replacement: Vec<u8> = #root::serde_json::to_vec(&record).expect("Failed to serialize incremented accumulator");
+
+                            let result: Option<String> = #root::redis::cmd("SET").arg(&key).arg(&replacement).arg("IFEQ").arg(&bytes).query_async(&mut conn).await.expect("Redis CAS failed");
+
+                            if (result.is_some()) {
+                                return next_val; // CAS succeeded
+                            }
+                            // Loop again because CAS failed
+                        }
+                        #redis_state_type_ident::Terminated => {
+                            // Scan already terminated
+                            return None;
+                        }
+                    }
+                }
 
                 // TODO: IMPLEMENT THE ACTUAL UPDATE STEP IN A LOOP
                 None

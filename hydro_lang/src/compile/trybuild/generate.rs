@@ -254,12 +254,33 @@ pub fn compile_graph_trybuild(
 
                     let mut #dfir_ident = #dfir_expr;
 
-                    let local_set = #root::runtime_support::tokio::task::LocalSet::new();
+                    // Register a SIGTERM listener.
+                    let mut sigterm =
+                        #root::runtime_support::tokio::signal::unix::signal(
+                            #root::runtime_support::tokio::signal::unix::SignalKind::terminate()
+                        ).expect("Failed to register SIGTERM handler");
+
+                    eprintln!("[Hydro] SIGTERM handler registered");
+
+                    // Launch the sidecars as before.
                     #(
-                        let _ = local_set.spawn_local( #sidecars ); // Uses #dfir_ident
+                        let _ = #root::runtime_support::tokio::spawn(#sidecars);
                     )*
 
-                    let _ = local_set.run_until(#dfir_ident.run()).await;
+                    eprintln!("[Hydro] Starting DFIR runtime");
+
+                    // Wait for either DFIR completion or SIGTERM.
+                    #root::runtime_support::tokio::select! {
+                        _ = #dfir_ident.run() => {
+                            unreachable!("DFIR unexpectedly terminated");
+                        }
+
+                        _ = sigterm.recv() => {
+                            eprintln!("[Hydro] SIGTERM received");
+                        }
+                    }
+
+                    eprintln!("[Hydro] Exiting main");
                 }
             }
         }
